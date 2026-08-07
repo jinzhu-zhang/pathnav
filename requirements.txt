@@ -1,0 +1,17 @@
+# Runtime dependencies for path_nav.py (the on-device navigation app).
+#
+# This is the lean, Yocto-target footprint: a small ONNX runtime + OpenCV +
+# NumPy. NO PyTorch is needed to RUN the app -- the models are already frozen
+# to .onnx (see requirements-export.txt for the one-time export step).
+#
+# Install (use a venv; on Debian/Ubuntu pass --system-site-packages if you want
+# to reuse the apt OpenCV instead of the pip wheel below):
+#     python3 -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements.txt
+#
+# Note for Yocto: opencv has a real recipe (meta-openembedded); there you would
+# use the system OpenCV and drop the opencv-python line below.
+
+numpy==2.5.0
+onnxruntime==1.27.0
+opencv-python==4.13.0.92

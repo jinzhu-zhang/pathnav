@@ -1,0 +1,539 @@
+================================================================================
+PATHNAV — ASSISTIVE WALKABLE-PATH NAVIGATION FOR THE VISUALLY IMPAIRED
+Computer Engineering Portfolio Write-Up
+================================================================================
+
+Author:   Jinzhu Zhang (2nd-year Computer Engineering)
+Platform: Raspberry Pi 5 + ESP32-S3 camera
+Repo:     https://github.com/jinzhu-zhang/vision_project
+Diagram:  docs/assets/architecture_diagram.png
+
+--------------------------------------------------------------------------------
+1. PROJECT TITLE + ONE-LINE HOOK
+--------------------------------------------------------------------------------
+
+PathNav — a chest-mounted camera system that watches the ground ahead, finds the
+walkable path, measures how far away obstacles are in metres, and tells the user
+how to steer around them.
+
+One line: "Real-time-ish monocular path guidance on a Raspberry Pi 5 that steers
+a blind walker around obstacles using ground-plane geometry and a bird's-eye
+costmap planner — no depth sensor, no cloud, no GPU."
+
+
+--------------------------------------------------------------------------------
+2. HERO VISUAL — SYSTEM ARCHITECTURE
+--------------------------------------------------------------------------------
+
+See docs/assets/architecture_diagram.png. Text version of the data flow:
+
+  ESP32-S3 camera (USB UVC  OR  Wi-Fi HTTP MJPEG)
+        |
+        v
+  Raspberry Pi 5  ->  capture + downscale to 320x240
+        |
+        +--> SegFormer-B0 (ONNX, every 2nd frame) --+
+        |                                            +--> hybrid walkable mask
+        +--> HSV appearance mask (every frame) ------+     (+ temporal EMA,
+        |                                                   hole fill, feet lock,
+        |                                                   collapse guard)
+        |
+        +--> YOLOv8n (ONNX, every frame) --> boxes --> IoU tracker (heading, TTC)
+        |
+        +--> GroundPlane ranging (camera height + adaptive tilt + FOV)
+        |         --> per-object distance / bearing / physical size in metres
+        |
+        +--> BevPlanner: warp mask + obstacle footprints into a metric
+        |    bird's-eye costmap (10 cm cells), score a fan of 31 constant-
+        |    curvature arcs, keep the cheapest
+        |
+        v
+  Guidance output (EMA-smoothed, 1 s cadence):
+     STRAIGHT / BEAR LEFT / BEAR RIGHT / NO PATH
+     + warnings: FORK, CROSSING AHEAD, "person 4.4 m ahead, on your path"
+        |
+        +--> v1 out: printed text over SSH
+        +--> annotated MP4 + per-frame JSONL telemetry (for offline analysis)
+
+
+--------------------------------------------------------------------------------
+3. PROBLEM / MOTIVATION
+--------------------------------------------------------------------------------
+
+My grandma is blind and struggles to get around on her own — she bumps into
+people, furniture, and the edges of paths that sighted people avoid without
+thinking. I wanted to build a wearable that watches the ground ahead and gives
+her simple spoken cues ("bear left", "person ahead") so she can walk more
+confidently.
+
+It was interesting because it forces real engineering trade-offs: you can't just
+throw a big GPU model at it — a wearable has to be small, battery-powered, and
+work outdoors on messy real-world surfaces. My constraints were a single camera
+(no stereo rig or LiDAR), a Raspberry Pi 5 CPU only (no accelerator yet),
+walking-pace guidance rather than gaming frame rates, and a "detect-and-report"
+scope (no motors — the human still walks). To iterate before the wearable
+hardware existed, I recorded walks on my phone and processed them at the same low
+resolution the ESP32 camera would produce.
+
+
+--------------------------------------------------------------------------------
+4. MY CONTRIBUTION
+--------------------------------------------------------------------------------
+
+This is a solo project. I built the whole pipeline; the only off-the-shelf parts
+are the two pretrained neural networks (SegFormer-B0 and YOLOv8n), which I did
+NOT train — I use them as fixed feature extractors and put the engineering into
+the geometry and planning around them.
+
+WHAT I DESIGNED
+  - The overall pipeline: capture -> hybrid walkable mask -> obstacle detection
+    -> metric ranging -> bird's-eye planner -> smoothed steering cues.
+  - The monocular ground-plane ranging model (turn a pixel into metres from
+    known camera height + tilt + field of view).
+  - The adaptive tilt scheme: estimate the camera's downward tilt from the
+    visible horizon each frame, as a software stand-in for a future IMU.
+  - The hybrid segmentation strategy (color + neural + temporal memory) after
+    the neural net alone failed on real gravel trails.
+  - The metric bird's-eye costmap + constant-curvature arc planner, so the guide
+    line steers AROUND obstacles instead of drawing a line through them.
+  - The offline evaluation methodology (JSONL telemetry per frame + analysis
+    tools + planner unit tests) so I could measure changes instead of guessing.
+
+WHAT I IMPLEMENTED
+  - path_nav.py (~2000 lines): ONNX SegFormer + YOLO wrappers, the full mask
+    fusion pipeline, horizon/tilt tracking, guidance smoothing and hysteresis,
+    camera / video / image I/O, and all the annotated drawing.
+  - ground_plane.py: ray-ground intersection, forward/inverse projection
+    (used to build the bird's-eye homography), object size estimation.
+  - planner.py (~800 lines): image->BEV warp, cost layers, the 31-arc scored
+    fan, fork and crossing detection in metric space, BEV debug rendering.
+  - tracking.py: greedy IoU multi-object tracker with per-track heading and
+    time-to-contact for closing pedestrians.
+  - tools/ and tests/: batch renderer, per-stage speed bench, clip A/B eval,
+    JSONL analyzer, warning-latch checker, and planner geometry unit tests.
+
+
+--------------------------------------------------------------------------------
+5. TECHNICAL ARCHITECTURE
+--------------------------------------------------------------------------------
+
+The system is split into four cooperating modules with clear responsibilities:
+
+  path_nav.py    - orchestrator: models, mask, guidance, I/O
+  ground_plane.py- the camera geometry / metric ranging
+  planner.py     - "where do I actually walk" decision, in metres
+  tracking.py    - object identity + motion over time
+
+INTERFACES / PROTOCOLS AND WHY
+
+  USB UVC (V4L2):    The ESP32-S3 presents as /dev/video0 (MJPG 640x480). Chosen
+                     for the lowest-latency local capture path when the camera is
+                     wired to the Pi — the standard OpenCV VideoCapture backend
+                     handles it with no custom driver.
+
+  HTTP MJPEG:        The same camera can also stream over Wi-Fi at
+                     http://<esp32-ip>:81/stream. This let me test an untethered
+                     camera without touching the vision code — I swap a source
+                     string, not the pipeline. It's the stepping stone toward a
+                     wireless wearable.
+
+  ONNX Runtime (CPU):All inference runs through ONNX Runtime, not PyTorch. I
+                     deliberately dropped PyTorch/ultralytics on the device: an
+                     .onnx file is just the frozen graph + weights, so the
+                     on-device dependency set shrinks to onnxruntime + opencv +
+                     numpy. That is both faster to load on ARM CPU and much closer
+                     to a future minimal embedded image (PyTorch has no clean
+                     embedded-Linux recipe; ONNX Runtime and OpenCV do).
+
+  SSH text (v1 UI):  Cues print over SSH for now. It's the fastest thing to debug
+                     against, and audio/TTS output is the next hardware step.
+
+  JSONL telemetry:   Every processed frame writes one JSON line (cue, offset,
+                     fork/crossing flags, planner reach, and every object's
+                     distance/bearing/size/on-path/TTC). This is what makes the
+                     project measurable instead of anecdotal.
+
+NOT USED (and not claimed): ROS2, MQTT, CAN, SPI/I2C/UART device drivers,
+FreeRTOS. This revision is intentionally a vision + planning prototype on Linux.
+Those interfaces belong to the wearable/MCU phase that hasn't been built yet, and
+I'd rather be honest about the current boundary than pad the stack.
+
+
+--------------------------------------------------------------------------------
+6. HARDWARE
+--------------------------------------------------------------------------------
+
+COMPONENTS
+  - Raspberry Pi 5           On-device inference + planning. Runs Ubuntu today
+                             for fast iteration (pip just works); a minimal Yocto
+                             image is the eventual target.
+  - ESP32-S3 UVC webcam      Forward-facing camera. Used two ways in code: USB
+                             (/dev/video0, MJPG 640x480) and network MJPEG.
+  - iPhone 16 Pro (dev only) Not part of the product — used to record real
+                             outdoor walk clips, which I downscale/process at
+                             320x240 to approximate the ESP32 camera class.
+
+INTERFACES ACTUALLY EXERCISED
+  - USB UVC / V4L2 video capture
+  - HTTP MJPEG streaming over Wi-Fi
+  - (Planned) ADC/IMU for tilt on the real wearable; PWM/GPIO/DAC for a
+    haptic/audio output stage — not yet built.
+
+CAMERA MOUNTING ASSUMPTIONS USED FOR RANGING
+  - Height above ground:  1.410 m (55.5 in, chest mount)
+  - Nominal downward tilt: 18.43 deg (then measured/adapted per frame)
+  - Field of view:        ~70 deg across the long sensor side
+
+INTERESTING ENGINEERING DECISIONS
+  - Phone footage first, wearable second. Real gravel trails and street crossings
+    are far more honest than synthetic data, and matching the processing
+    resolution to the ESP32 means results should transfer to the real camera.
+  - USB locally, MJPEG optionally, one code path. Both feed the same OpenCV
+    capture, so the vision app doesn't care how the pixels arrive.
+  - No depth sensor on purpose. Stereo (two cameras) or a checkerboard-calibrated
+    pair would give true depth, but that's bulky and awkward on a chest mount for
+    a v1. A single camera at a KNOWN height, using the flat-ground assumption, is
+    a better fit for a wearable — see challenge #1.
+
+
+--------------------------------------------------------------------------------
+7. SOFTWARE / FIRMWARE
+--------------------------------------------------------------------------------
+
+Language: Python 3.12 (this stage is an application, not an RTOS firmware image
+yet). The engineering that matters:
+
+  RESOURCE-AWARE SCHEDULING
+    SegFormer is ~all of the per-frame cost (~500 ms), so it runs only every 2nd
+    processed frame and its class masks are reused in between. YOLO runs EVERY
+    frame because obstacles are time-critical. The cheap HSV mask + temporal EMA
+    also run every frame, so the walkable overlay stays smooth even on the frames
+    SegFormer is skipped. This is a hard-real-world scheduling trade: spend the
+    expensive budget where staleness is cheap, keep the cheap work where
+    freshness matters.
+
+  STATE MACHINES / TEMPORAL FILTERING (in practice, not in theory)
+    - Sticky per-pixel votes for the "road vs walkway" and "walkable" decisions,
+      so shadows and texture can't flip the mask frame to frame.
+    - A collapse guard: if the total walkable area suddenly craters (a run of bad
+      SegFormer frames), reject that frame and reuse the last good mask for up to
+      12 frames — but still report NO PATH if the path genuinely ends.
+    - Cue hysteresis + EMA on the steering angle, so the user doesn't hear
+      "STRAIGHT / LEFT / STRAIGHT / LEFT" spam on a straight path.
+    - Warning latches (rise/hold) for FORK and CROSSING so a one-frame blip
+      doesn't become a spoken warning, and a real one doesn't stutter.
+
+  METRIC PLANNING, NOT PIXEL HEURISTICS
+    Obstacles are stamped as physical footprints (in metres) on a 10 m x 14 m
+    grid at 10 cm resolution. 31 constant-curvature arcs are scored on cost
+    layers (non-walkable, clearance/distance-transform, obstacle footprints,
+    predicted motion). The winning arc's curvature IS the steering command; the
+    gap to the runner-up is a confidence; two well-separated minima mean a real
+    fork. Because arcs start at the feet and bend smoothly, every candidate is
+    walkable by construction (unlike grid A*, which needs smoothing).
+
+  ERROR HANDLING / ROBUSTNESS
+    - Rays at or above the horizon return NO distance rather than a fake number
+      (distance explodes to infinity near the horizon).
+    - Ranges are clipped at 20 m — beyond that a 1-pixel error is tens of metres,
+      so it's reported as "far" with no metric value instead of "1244 m".
+    - The planner falls back to the mask centre-line if no arc is viable.
+    - Far obstacle footprints are padded more than near ones (range error grows
+      with distance).
+
+  CONCURRENCY / DMA / INTERRUPTS
+    Not used at this stage — it's a single-threaded CPU pipeline. Honest note:
+    the natural next step for the wearable is pipelining capture / inference /
+    planning across cores, and moving output to an interrupt-driven audio/haptic
+    MCU. That's future work, not something I'm claiming now.
+
+  LOGGING
+    One JSON line per frame (tools/analyze_logs.py consumes it). This is what let
+    me tune thresholds against numbers instead of vibes.
+
+
+--------------------------------------------------------------------------------
+8. KEY TECHNICAL CHALLENGES
+--------------------------------------------------------------------------------
+
+### CHALLENGE 1 — Figuring out distance with only one camera
+
+PROBLEM
+  "How far is that person?" drives both the spoken warning and the planner, which
+  reasons in metres. A single camera gives no depth for free. Pixel height is a
+  crude proxy; true depth would need stereo, which doesn't suit a chest wearable.
+
+INVESTIGATION
+  I started with image-space proximity bins (how low the box sits, how tall it
+  is). I looked into stereo + checkerboard calibration as a later option, but two
+  synchronized cameras plus calibration is a lot of bulk for v1. The realization:
+  for one camera at a FIXED, KNOWN height and downward tilt, the flat-ground
+  assumption gives you geometry for free. A ray through the pixel where an object
+  touches the ground (its box bottom-centre) hits the ground plane at a
+  computable distance. So I filmed at a fixed chest height and tilt and built the
+  ranging around that.
+
+  The catch: tilt is the one parameter you can't take on trust. A single
+  hardcoded tilt was wrong by up to ~5 degrees across my clips — the true horizon
+  sat at processing row 77 in one clip, 61 in another, 46 in a third, against 63
+  assumed. Too high and the mask climbs into the sky; too low and sky gets warped
+  into the grid as if it were ground tens of metres out, which manufactured
+  phantom forks and collapsing masks.
+
+SOLUTION
+  I implemented GroundPlane (ground_plane.py): build from field-of-view, cast a
+  ray, intersect the plane, return distance/bearing, and an inverse projection
+  used to build the bird's-eye homography. Then I added a HorizonTracker that
+  estimates the horizon from the sky each frame, backs out the tilt, takes a
+  median over 15 frames, and only re-aims the geometry when the change exceeds
+  0.75 deg (rebuilding the warp isn't free). This is the "software fix to figure
+  out a tilt angle" — on the real wearable this should come from an IMU, which
+  knows tilt from gravity for free and doesn't need sky in view.
+
+RESULT
+  Obstacles now report real distances (e.g. "person 4.4 m ahead"), and the
+  planner reaches ~5.9 m on average across the test set. It's still approximate
+  (flat-ground, single camera), but it's good enough to warn and to steer, and it
+  removed the phantom forks the wrong tilt was causing.
+
+
+### CHALLENGE 2 — Getting a trustworthy ground / walkable mask
+
+PROBLEM
+  Everything downstream trusts the green "walkable" mask. If it's wrong, every
+  cue is wrong. Real outdoor surfaces (loose gravel, sun/shade, wet patches) are
+  much messier than clean datasets.
+
+INVESTIGATION — what I tried and what broke
+  - SegFormer-B0 alone (ADE20K classes): on real gravel it mislabels the path,
+    and sometimes prefers the grass beside it. The mask gets holes or follows the
+    grass.
+  - Vetoing the ADE20K "rock" class (seemed obviously right): on gravel,
+    SegFormer calls the PATH ITSELF rock — ~70% of the surface underfoot in one
+    clip — so the veto punched holes straight through the path.
+  - A sky veto applied to the whole frame: "bright and desaturated" also
+    describes sunlit concrete exactly, so it punched big holes in the path
+    wherever the sun hit and dragged the guide line to the shaded side.
+  - Recomputing the whole mask every frame with no memory: one bad SegFormer
+    frame made the entire path vanish, and the guide line snapped around.
+
+SOLUTION — the hybrid that actually works
+  - HSV appearance mask EVERY frame: a pedestrian path is almost always a
+    low-saturation grey (asphalt/concrete/gravel) surrounded by vivid green
+    grass, so color separates them cheaply and reliably. This is the primary
+    mask.
+  - SegFormer as SUPPLEMENT + STRUCTURE VETO (walls, buildings, people, cars...)
+    but explicitly NOT "rock". I trust its negative call on tall solid things
+    even when I don't trust its positive call on ground.
+  - Sky veto ONLY above the estimated horizon (blue-hue band), never on the
+    ground below it.
+  - Temporal EMA "stickiness", small-hole fill (only holes < 1.5% of the frame,
+    so a real obstacle still punches through), a feet-connected component so the
+    path stays locked under the user, and the collapse guard from above.
+
+RESULT
+  Stable corridors on gravel and sidewalk clips, and the mask survives SegFormer
+  running only every 2nd frame — which is what buys back the frame rate.
+
+
+### CHALLENGE 3 — Avoiding obstacles when you can't train a nav policy on the Pi
+
+PROBLEM
+  I wanted smarter behaviour than "aim at the centre of the green mask." My first
+  instinct was to train an end-to-end obstacle-avoidance model. That wasn't
+  realistic on a Pi: CPU only, no large labeled navigation dataset, and PyTorch
+  is too heavy for the embedded target. On top of that, a mask centre-line
+  literally ignores a person standing on the path (they only become a spoken
+  warning — the line runs through them), and dodging in image space is
+  geometrically wrong: the same pixel offset means centimetres near your feet but
+  metres up near the horizon.
+
+INVESTIGATION
+  If I can't learn the policy, I can make the geometry do the reasoning. Since
+  GroundPlane already gives real (X, Z) metres for any ground pixel, I can build a
+  proper bird's-eye map and plan on it the way a mobile robot does — but tuned for
+  a human walker (smooth arcs, not staircase A* paths).
+
+SOLUTION
+  BevPlanner: warp the mask into a metric top-down grid, stamp obstacle
+  footprints (padded by range uncertainty), add a soft "predicted motion" cost
+  for moving objects, and score a fan of 31 constant-curvature arcs. Cheapest arc
+  wins; its curvature becomes the steering cue. I also added time-to-contact:
+  distance alone is the wrong trigger for a moving person (3 m is ~1 second of
+  warning), so a pedestrian closing within 5 seconds is flagged early and stays
+  flagged, instead of toggling on the boundary.
+
+RESULT
+  In the annotated clips the guide line visibly bends around on-path pedestrians,
+  and it does so cheaply: the planner adds only ~4 ms/frame on top of the ~530 ms
+  the neural nets already cost. I get most of the benefit of a learned policy from
+  explicit geometry that runs on a Pi.
+
+
+--------------------------------------------------------------------------------
+9. RESULTS / QUANTITATIVE METRICS
+--------------------------------------------------------------------------------
+
+Measured on a Raspberry Pi 5 (CPU), 6 real outdoor walk clips, SegFormer stride
+2, 320x240 processing resolution.
+
+  PERFORMANCE
+    End-to-end frame rate ............ ~1.8 - 1.9 FPS
+    Neural inference / frame ......... ~527 - 555 ms  (SegFormer + YOLO)
+    Planning / frame ................. ~4 ms
+    Planner geometry (unit test) ..... ~3.1 ms/frame, budget < 15 ms  (PASS)
+
+  COVERAGE / BEHAVIOUR (4341 logged frames)
+    Frames the planner produced a plan .. 99.8%
+    Mean planner reach .................. ~5.9 m
+    Cue distribution .................... BEAR LEFT 48% / STRAIGHT 42% /
+                                          BEAR RIGHT 9% / NO PATH < 0.1%
+    Raw fork flag rate .................. ~4% of frames (latched for the user)
+    Raw crossing flag rate .............. ~10% of frames
+
+  GEOMETRY / CONFIG
+    Camera height / nominal tilt ........ 1.41 m / 18.43 deg (tilt adapted online)
+    Field of view (long side) ........... ~70 deg
+    Bird's-eye grid ..................... 10 m x 14 m, 10 cm cells
+    Arc fan ............................. 31 arcs, max curvature 0.30 /m
+    Ranging trust ceiling ............... 20 m
+    Hazard time-to-contact .............. 5.0 s
+
+  MODEL / FOOTPRINT
+    SegFormer-B0 ONNX ................... ~15 MB
+    YOLOv8n ONNX ........................ ~13 MB
+    On-device deps ...................... onnxruntime + opencv + numpy (no PyTorch)
+
+  HONEST TAKEAWAY
+    Offline validation and slow live demos work well; true walking-speed live
+    guidance needs INT8 quantization, smaller network inputs, and/or an
+    accelerator. tools/bench_speed.py maps that trade space (both nets are fed far
+    more pixels than the 320x240 the guidance actually reasons over — the first
+    place to cut before reaching for hardware).
+
+
+--------------------------------------------------------------------------------
+10. TESTING & VALIDATION
+--------------------------------------------------------------------------------
+
+  UNIT / GEOMETRY TESTS  (tests/test_planner.py — all pass)
+    - GroundPlane.project() inverts point() (round-trip error ~1e-16 m)
+    - Image->bird's-eye homography maps known metres to the correct grid cells
+    - Obstacle avoidance: open ground -> STRAIGHT; obstacle dead ahead -> leaves
+      centre; blocked left -> steers right, blocked right -> steers left; full
+      wall -> correctly reports no usable plan
+    - Corridor centring: bending corridors produce the right-signed steer
+    - Fork detection: real split -> FORK; shadow notch / thin nick -> no fork
+    - Timing budget: planner stays under 15 ms on real frames
+
+  INTEGRATION ON REAL WALKS  (tools/render_test_videos.py)
+    Full pipeline over 6 phone-recorded clips -> annotated MP4 + per-frame JSONL,
+    including obstacle-on-path still frames for quick review.
+
+  A/B THRESHOLD TUNING  (tools/eval_clips.py)
+    Runs short CONTIGUOUS windows (contiguous matters — the mask carries temporal
+    state, so sampled frames wouldn't reproduce real behaviour) and reports fork
+    rate and steering magnitude, so a threshold change is judged in ~seconds
+    instead of an hour-long re-render.
+
+  TELEMETRY ANALYSIS  (tools/analyze_logs.py)
+    Cue distribution, fork episode lengths, planner reach health, arrow-vs-line
+    agreement — the numbers behind section 9.
+
+  WARNING-LATCH VALIDATION  (tools/check_warnings.py)
+    Compares raw per-frame fork/crossing flags against what the user actually
+    hears after the rise/hold latch, on real footage.
+
+  PERFORMANCE BENCHMARKS  (tools/bench_speed.py, tools/camera_test.py)
+    Per-stage inference timing at multiple input sizes; camera throughput/latency.
+
+  WHAT THIS IS NOT (yet)
+    No hardware-in-the-loop, oscilloscope, or logic-analyzer validation — there's
+    no custom board to probe yet. Validation today is software-in-the-loop on
+    recorded walks plus planner unit tests. HIL comes with the wearable.
+
+
+--------------------------------------------------------------------------------
+11. (RESERVED)
+--------------------------------------------------------------------------------
+
+Skipped to keep numbering aligned with the brief.
+
+
+--------------------------------------------------------------------------------
+12. LESSONS / FUTURE WORK
+--------------------------------------------------------------------------------
+
+  1. FINISH THE HARDWARE. Most of the work so far is on the software end — I built
+     the pipeline against phone footage (4K walks reduced to ESP32-like quality)
+     rather than a finished wearable. Next: make it an actual wearable that isn't
+     tethered by an ethernet/SSH connection, and add the SOUND component so it
+     reads directives out loud (TTS) instead of printing text.
+
+  2. MORE CAMERA POINTS OF VIEW. A single forward camera misses obstacles coming
+     from other directions. Adding a back (and maybe side) camera would catch
+     more hazards and make path decisions safer. The open design question is
+     fusion: how to combine front and back obstacle information into ONE steering
+     decision without the two views giving contradictory cues — likely by merging
+     both into a single shared bird's-eye costmap centred on the user.
+
+  3. IMU FOR TILT instead of estimating the horizon from the image — cheaper,
+     works without sky in view, and exact.
+
+  4. SPEED: INT8 quantization, smaller network inputs, and/or an accelerator to
+     reach comfortable walking-pace updates with stable latency.
+
+  5. MINIMAL OS IMAGE (Yocto) once the Python dependency set is frozen, for a real
+     embedded deployment.
+
+  LESSONS LEARNED
+    - Real data exposes failure modes no clean dataset will (the "rock = path"
+      problem is a good example). Cheap classical CV (HSV) beat a neural net on my
+      actual surfaces.
+    - Doing the reasoning in METRES instead of pixels made the avoidance logic
+      correct by construction — worth the up-front geometry work.
+    - Measuring everything (JSONL + analysis tools) changed how I tuned: I stopped
+      guessing at thresholds and started sweeping them against numbers.
+
+
+--------------------------------------------------------------------------------
+13. TECH STACK
+--------------------------------------------------------------------------------
+
+  Languages:   Python 3.12
+  Hardware:    Raspberry Pi 5, ESP32-S3 UVC camera
+  ML runtime:  ONNX Runtime (CPU); models exported once from PyTorch / Ultralytics
+  Vision:      OpenCV, NumPy; SegFormer-B0 (ADE20K), YOLOv8n (COCO)
+  Interfaces:  USB UVC (V4L2), HTTP MJPEG
+  Tools:       Git, SSH + tmux on the Pi, custom eval/render/bench scripts
+
+  (Deliberately not the centerpiece — the engineering decisions and results are.)
+
+
+--------------------------------------------------------------------------------
+14. GITHUB + DOCUMENTATION
+--------------------------------------------------------------------------------
+
+  Repository:  https://github.com/jinzhu-zhang/vision_project
+  README.md:   Overview -> Demo -> Architecture -> Hardware -> Software ->
+               Implementation -> Challenges -> Testing -> Results -> How to Run ->
+               Future Improvements
+  This file:   PORTFOLIO.txt — the long-form write-up for recruiters.
+  Design notes: docs/HANDOFF.md — the original architecture/decision log.
+
+  REPO LAYOUT
+    path_nav.py        main navigation application
+    ground_plane.py    monocular metric ranging
+    planner.py         bird's-eye costmap + arc planner
+    tracking.py        multi-object tracker (IoU + heading + TTC)
+    tools/             export, bench, eval, batch render, log analysis
+    tests/             planner geometry unit tests
+    docs/              architecture diagram + design notes
+    media/demos/       small demo stills for the README
+    models/            how to obtain the ONNX weights (weights are gitignored)
+
+================================================================================
+Built as a 2nd-year Computer Engineering project reaching for 3rd/4th-year
+embedded + vision systems work. It is a working prototype, with the FPS limits
+and remaining hardware gaps stated honestly above rather than hidden.
+================================================================================

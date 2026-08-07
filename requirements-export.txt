@@ -1,0 +1,18 @@
+# One-time model-export dependencies (NOT needed on the device that runs the app).
+#
+# Run these once on a machine with PyTorch (e.g. the Pi itself, or a Mac) to
+# produce the .onnx artifacts, then deploy only requirements.txt at runtime:
+#     pip install -r requirements-export.txt
+#     python3 export_segformer.py                                  # -> segformer_b0_ade_onnx/model.onnx
+#     yolo export model=yolov8n.pt format=onnx imgsz=640 opset=12  # -> yolov8n.onnx
+#
+# torch/torchvision are pinned to CPU-only aarch64 wheels: newer torch (>=2.6)
+# on aarch64 pulls in large NVIDIA CUDA wheels, and transformers >=4.45 requires
+# torch >=2.4 -- this pinned combo avoids both pitfalls on the Pi.
+
+torch==2.2.2
+torchvision==0.17.2
+transformers==4.44.2
+onnx==1.22.0
+onnxslim==0.1.94
+ultralytics==8.4.81

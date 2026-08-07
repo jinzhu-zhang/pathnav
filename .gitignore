@@ -1,0 +1,47 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Model weights (download / export locally — see models/README.md)
+*.onnx
+*.pt
+*.pth
+*.engine
+segformer_b0_ade_onnx/
+
+# Large / local media (keep small demo stills under media/demos/)
+test_videos/
+test_videos_annotated/
+test_videos_annotated_pre_planner/
+samples/
+samples_annotated/
+*.mov
+*.mp4
+*.avi
+annotated_*.jpg
+annotated_path.jpg
+
+# Logs and local run artifacts
+logs/
+*.log
+demo_tracks.jsonl
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets / local env
+.env
+.env.*
