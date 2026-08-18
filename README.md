@@ -60,4 +60,3 @@ models/  how to obtain ONNX weights (weights are gitignored)
 media/   small demo stills
 ```
 
-See [`PORTFOLIO.txt`](PORTFOLIO.txt) for the full engineering write-up.
